@@ -1,0 +1,73 @@
+--- a/include/NeoFOAM/auxiliary/readers.hpp
++++ b/include/NeoFOAM/auxiliary/readers.hpp
+@@ -220,6 +220,32 @@
+     std::string activePatchName;
+     const Foam::fvPatch* activeFoamPatch = nullptr;
+ 
++    // Replaces the OpenFOAM token list of a uniform entry ("uniform x" / "uniform (x y z)") by its
++    // value, e.g. inletValue of inletOutlet and outletValue of outletInlet. A non-uniform entry
++    // yields zero.
++    auto insertUniformValue = [](NeoN::Dictionary& dict, const std::string& key)
++    {
++        NeoN::TokenList tokenList = dict.template get<NeoN::TokenList>(key);
++        if constexpr (std::is_same<type_primitive_t, NeoN::Vec3>::value)
++        {
++            NeoN::Vec3 value {};
++            if (tokenList.size() >= 4)
++            {
++                value[0] = detail::tokenAsScalar(tokenList, 1);
++                value[1] = detail::tokenAsScalar(tokenList, 2);
++                value[2] = detail::tokenAsScalar(tokenList, 3);
++            }
++            dict.insert(key, value);
++        }
++        else
++        {
++            dict.insert(
++                key,
++                tokenList.size() >= 2 ? detail::tokenAsScalar(tokenList, 1) : type_primitive_t {}
++            );
++        }
++    };
++
+     std::map<std::string, std::function<void(NeoN::Dictionary&)>>
+         patchInserter {
+             {"fixedGradient",
+@@ -334,29 +360,16 @@
+             {"nutkWallFunction",
+              [](auto& dict) { dict.insert("type", std::string("nutkWallFunction")); }},
+             {"inletOutlet",
+-             [](auto& dict)
++             [&](auto& dict)
+              {
+                  dict.insert("type", std::string("inletOutlet"));
+-                 NeoN::TokenList tokenList = dict.template get<NeoN::TokenList>("inletValue");
+-                 if constexpr (std::is_same<type_primitive_t, NeoN::Vec3>::value)
+-                 {
+-                     NeoN::Vec3 inletValue {};
+-                     if (tokenList.size() >= 4)
+-                     {
+-                         inletValue[0] = detail::tokenAsScalar(tokenList, 1);
+-                         inletValue[1] = detail::tokenAsScalar(tokenList, 2);
+-                         inletValue[2] = detail::tokenAsScalar(tokenList, 3);
+-                     }
+-                     dict.insert("inletValue", inletValue);
+-                 }
+-                 else
+-                 {
+-                     dict.insert(
+-                         "inletValue",
+-                         tokenList.size() >= 2 ? detail::tokenAsScalar(tokenList, 1)
+-                                               : type_primitive_t {}
+-                     );
+-                 }
++                 insertUniformValue(dict, "inletValue");
++             }},
++            {"outletInlet",
++             [&](auto& dict)
++             {
++                 dict.insert("type", std::string("outletInlet"));
++                 insertUniformValue(dict, "outletValue");
+              }},
+             {"freestream",
+              [&](auto& dict)

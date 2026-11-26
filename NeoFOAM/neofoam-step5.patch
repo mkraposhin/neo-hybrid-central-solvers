@@ -1,0 +1,64 @@
+diff --git a/include/NeoFOAM/auxiliary/readers.hpp b/include/NeoFOAM/auxiliary/readers.hpp
+index a2ca800c..e61768ba 100644
+--- a/include/NeoFOAM/auxiliary/readers.hpp
++++ b/include/NeoFOAM/auxiliary/readers.hpp
+@@ -110,6 +110,28 @@ void insertFrozenTotalPressure(NeoN::Dictionary& dict)
+     dict.insert("fixedGradient", NeoN::zero<ValueType>());
+ }
+ 
++/**
++ * @brief Replace the token list "uniform <value>" of the entry key by the scalar value.
++ *
++ * Only the uniform form is supported; a non-uniform entry is an error.
++ */
++inline void
++insertUniformScalar(NeoN::Dictionary& dict, const std::string& key, const std::string& patchName)
++{
++    if (!dict.contains(key))
++    {
++        throw std::runtime_error("Entry '" + key + "' is missing on patch '" + patchName + "'.");
++    }
++    NeoN::TokenList tokenList = dict.get<NeoN::TokenList>(key);
++    if (tokenList.size() != 2 || tokenList.get<std::string>(0) != "uniform")
++    {
++        throw std::runtime_error(
++            "Entry '" + key + "' on patch '" + patchName + "' must be 'uniform <value>'."
++        );
++    }
++    dict.insert(key, tokenAsScalar(tokenList, 1));
++}
++
+ /**
+  * @brief Copy a `uniform` primitive from one dictionary entry into another key.
+  *
+@@ -447,6 +469,30 @@ auto readVolBoundaryConditions(const NeoN::UnstructuredMesh& nfMesh, const FoamT
+                      }
+                  }
+              }},
++            {"totalTemperature",
++             [&](auto& dict)
++             {
++                 // NeoN's totalTemperature: T0 on outflow, T0/(1 + 0.5 psi (gamma-1)/gamma |U|^2)
++                 // on inflow, from phi, U and psi in the BoundaryContext. T0 arrives as the token
++                 // list "uniform <value>"; gamma is a plain scalar already.
++                 dict.insert("type", std::string("totalTemperature"));
++                 if constexpr (std::is_same<type_primitive_t, NeoN::scalar>::value)
++                 {
++                     detail::insertUniformScalar(dict, "T0", activePatchName);
++                 }
++             }},
++            {"subsonicSupersonicPressureOutlet",
++             [&](auto& dict)
++             {
++                 // NeoN's subsonicSupersonicPressureOutlet: compressible total pressure p0 on
++                 // subsonic faces, zero gradient on supersonic faces; phi, U, psi and the gamma
++                 // field come from the BoundaryContext. p0 arrives as "uniform <value>".
++                 dict.insert("type", std::string("subsonicSupersonicPressureOutlet"));
++                 if constexpr (std::is_same<type_primitive_t, NeoN::scalar>::value)
++                 {
++                     detail::insertUniformScalar(dict, "p0", activePatchName);
++                 }
++             }},
+             {"uniformTotalPressure",
+              [&](auto& dict)
+              {

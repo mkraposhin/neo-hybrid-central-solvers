@@ -1,0 +1,678 @@
+diff --git a/include/NeoN/finiteVolume/cellCentred/boundary.hpp b/include/NeoN/finiteVolume/cellCentred/boundary.hpp
+index 8edee44b..eaf1e994 100644
+--- a/include/NeoN/finiteVolume/cellCentred/boundary.hpp
++++ b/include/NeoN/finiteVolume/cellCentred/boundary.hpp
+@@ -20,6 +20,8 @@
+ #include "boundary/volume/slip.hpp"
+ #include "boundary/volume/inletOutlet.hpp"
+ #include "boundary/volume/totalPressure.hpp"
++#include "boundary/volume/totalTemperature.hpp"
++#include "boundary/volume/subsonicSupersonicPressureOutlet.hpp"
+ 
+ #include "boundary/surface/empty.hpp"
+ #include "boundary/surface/calculated.hpp"
+@@ -140,6 +142,8 @@ template class fvcc::volumeBoundary::Slip<Vec3>;
+ template class fvcc::volumeBoundary::InletOutlet<scalar>;
+ template class fvcc::volumeBoundary::InletOutlet<Vec3>;
+ template class fvcc::volumeBoundary::TotalPressure<scalar>;
++template class fvcc::volumeBoundary::TotalTemperature<scalar>;
++template class fvcc::volumeBoundary::SubsonicSupersonicPressureOutlet<scalar>;
+ 
+ template class fvcc::SurfaceBoundaryFactory<scalar>;
+ template class fvcc::SurfaceBoundaryFactory<Vec3>;
+diff --git a/include/NeoN/finiteVolume/cellCentred/boundary/volume/subsonicSupersonicPressureOutlet.hpp b/include/NeoN/finiteVolume/cellCentred/boundary/volume/subsonicSupersonicPressureOutlet.hpp
+new file mode 100644
+index 00000000..e2f003d3
+--- /dev/null
++++ b/include/NeoN/finiteVolume/cellCentred/boundary/volume/subsonicSupersonicPressureOutlet.hpp
+@@ -0,0 +1,180 @@
++// SPDX-FileCopyrightText: 2026 NeoN authors
++//
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++#include <Kokkos_Core.hpp>
++
++#include "NeoN/fields/field.hpp"
++#include "NeoN/finiteVolume/cellCentred/boundary/volumeBoundaryFactory.hpp"
++#include "NeoN/finiteVolume/cellCentred/boundary/boundaryContext.hpp"
++#include "NeoN/finiteVolume/cellCentred/fields/surfaceField.hpp"
++#include "NeoN/finiteVolume/cellCentred/fields/volumeField.hpp"
++#include "NeoN/mesh/unstructured/unstructuredMesh.hpp"
++#include "NeoN/core/parallelAlgorithms.hpp"
++
++namespace NeoN::finiteVolume::cellCentred::volumeBoundary
++{
++
++namespace detail
++{
++
++// Per face, c = sqrt(gamma/psi):
++//   |U| <  c (subsonic):   fixed value p0 / (1 + 0.5 psi magSqr(U) (1 - pos(phi)))
++//   |U| >= c (supersonic): zero gradient
++// pos(phi) is 1 for phi > 0 only, as in the original. Without the fields (hasFields == false)
++// every face is a fixed value p0.
++inline void setSubsonicSupersonicPressureValue(
++    Field<NeoN::scalar>& domainVector,
++    const UnstructuredMesh& mesh,
++    std::pair<localIdx, localIdx> range,
++    NeoN::scalar p0,
++    bool hasFields,
++    View<const NeoN::scalar> boundaryFlux,
++    View<const Vec3> boundaryVelocity,
++    View<const NeoN::scalar> boundaryPsi,
++    View<const NeoN::scalar> boundaryGamma
++)
++{
++    const auto internalV = domainVector.internalVector().view();
++    auto [refGradV, valueV, valueFractionV, refValueV, ownersV] = views(
++        domainVector.boundaryData().refGrad(),
++        domainVector.boundaryData().value(),
++        domainVector.boundaryData().valueFraction(),
++        domainVector.boundaryData().refValue(),
++        mesh.boundaryMesh().faceOwners()
++    );
++
++    NeoN::parallelFor(
++        domainVector.exec(),
++        range,
++        NEON_LAMBDA(const localIdx i) {
++            [[maybe_unused]] const View<const NeoN::scalar> flux = boundaryFlux;
++            [[maybe_unused]] const View<const Vec3> velocity = boundaryVelocity;
++            [[maybe_unused]] const View<const NeoN::scalar> psi = boundaryPsi;
++            [[maybe_unused]] const View<const NeoN::scalar> gamma = boundaryGamma;
++
++            NeoN::scalar valueFraction = NeoN::scalar(1);
++            NeoN::scalar refValue = p0;
++            if (hasFields)
++            {
++                const Vec3 u = velocity[i];
++                const NeoN::scalar magSqrU = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
++                const NeoN::scalar c = Kokkos::sqrt(gamma[i] / psi[i]);
++                if (Kokkos::sqrt(magSqrU) < c)
++                {
++                    const NeoN::scalar notOut =
++                        flux[i] > NeoN::scalar(0) ? NeoN::scalar(0) : NeoN::scalar(1);
++                    refValue =
++                        p0 / (NeoN::scalar(1) + psi[i] * magSqrU * NeoN::scalar(0.5) * notOut);
++                }
++                else
++                {
++                    valueFraction = NeoN::scalar(0);
++                }
++            }
++
++            valueFractionV[i] = valueFraction;
++            refValueV[i] = refValue;
++            refGradV[i] = NeoN::scalar(0);
++            valueV[i] =
++                valueFraction * refValue + (NeoN::scalar(1) - valueFraction) * internalV[ownersV[i]];
++        },
++        "setSubsonicSupersonicPressureValue"
++    );
++}
++
++} // namespace detail
++
++// subsonicSupersonicPressureOutlet (hybridCentralSolvers): a mixed pressure condition that is the
++// compressible total pressure p0/(1 + 0.5 psi |U|^2 (1 - pos(phi))) on subsonic faces and zero
++// gradient on supersonic faces (|U| >= c, c = sqrt(gamma/psi)). phi, U, psi and gamma are looked
++// up by name in the BoundaryContext (dictionary keys phi, U, psi, gamma; defaults "phi", "U",
++// "psi", "gamma"); gamma is a field, as the original takes it from the thermophysical model.
++// Without them the patch is a fixedValue at p0. Not modelled: a non-uniform p0.
++template<typename ValueType>
++class SubsonicSupersonicPressureOutlet :
++    public VolumeBoundaryFactory<ValueType>::template Register<
++        SubsonicSupersonicPressureOutlet<ValueType>>
++{
++    using Base = VolumeBoundaryFactory<ValueType>::template Register<
++        SubsonicSupersonicPressureOutlet<ValueType>>;
++
++public:
++
++    using Base::correctBoundaryCondition;
++
++    // fixesValue = false: supersonic faces are zero gradient.
++    SubsonicSupersonicPressureOutlet(
++        const UnstructuredMesh& mesh, const Dictionary& dict, localIdx patchID
++    )
++        : Base(mesh, dict, patchID, {.assignable = true, .fixesValue = false}), mesh_(mesh),
++          p0_(dict.get<NeoN::scalar>("p0")),
++          phiName_(dict.contains("phi") ? dict.get<std::string>("phi") : std::string("phi")),
++          uName_(dict.contains("U") ? dict.get<std::string>("U") : std::string("U")),
++          psiName_(dict.contains("psi") ? dict.get<std::string>("psi") : std::string("psi")),
++          gammaName_(
++              dict.contains("gammaField") ? dict.get<std::string>("gammaField")
++                                          : std::string("gamma")
++          )
++    {}
++
++    virtual void correctBoundaryCondition(Field<ValueType>& domainVector) final
++    {
++        detail::setSubsonicSupersonicPressureValue(
++            domainVector, mesh_, this->range(), p0_, false, {}, {}, {}, {}
++        );
++    }
++
++    virtual void
++    correctBoundaryCondition(Field<ValueType>& domainVector, const BoundaryContext& ctx) final
++    {
++        if (!(ctx.hasSurfaceScalar(phiName_) && ctx.hasVector(uName_) && ctx.hasScalar(psiName_)
++              && ctx.hasScalar(gammaName_)))
++        {
++            correctBoundaryCondition(domainVector);
++            return;
++        }
++        detail::setSubsonicSupersonicPressureValue(
++            domainVector,
++            mesh_,
++            this->range(),
++            p0_,
++            true,
++            ctx.surfaceScalarField(phiName_).boundaryData().value().view(),
++            ctx.vectorFieldPtr(uName_).boundaryData().value().view(),
++            ctx.scalarFieldPtr(psiName_).boundaryData().value().view(),
++            ctx.scalarFieldPtr(gammaName_).boundaryData().value().view()
++        );
++    }
++
++    static std::string name() { return "subsonicSupersonicPressureOutlet"; }
++
++    std::string getName() const override { return name(); }
++
++    static std::string doc()
++    {
++        return "Compressible total pressure p0 on subsonic faces, zero gradient on supersonic "
++               "faces. Needs phi, U, psi and gamma in the BoundaryContext; without them it is a "
++               "fixedValue at p0.";
++    }
++
++    static std::string schema() { return "none"; }
++
++    std::unique_ptr<VolumeBoundaryFactory<ValueType>> clone() const final
++    {
++        return std::make_unique<SubsonicSupersonicPressureOutlet>(*this);
++    }
++
++private:
++
++    const UnstructuredMesh& mesh_;
++    NeoN::scalar p0_;
++    std::string phiName_;
++    std::string uName_;
++    std::string psiName_;
++    std::string gammaName_;
++};
++
++} // namespace NeoN::finiteVolume::cellCentred::volumeBoundary
+diff --git a/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalPressure.hpp b/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalPressure.hpp
+index 8bff57fb..da5db209 100644
+--- a/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalPressure.hpp
++++ b/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalPressure.hpp
+@@ -87,6 +87,63 @@ void setTotalPressureValue(
+     );
+ }
+ 
++// Compressible form of totalPressure (OpenFOAM's psi variant), gM1ByG = (gamma - 1)/gamma:
++//
++//   gamma > 1:  p = p0 / (1 + 0.5 psi gM1ByG (1 - pos0(phi)) magSqr(U))^(1/gM1ByG)
++//   gamma = 1:  p = p0 / (1 + 0.5 psi (1 - pos0(phi)) magSqr(U))
++//
++// psi, phi and U are the boundary values of the compressibility, the face flux and the velocity.
++inline void setCompressibleTotalPressureValue(
++    Field<NeoN::scalar>& domainVector,
++    std::pair<localIdx, localIdx> range,
++    NeoN::scalar p0,
++    NeoN::scalar gamma,
++    View<const NeoN::scalar> boundaryFlux,
++    View<const Vec3> boundaryVelocity,
++    View<const NeoN::scalar> boundaryPsi
++)
++{
++    auto [refGradV, valueV, valueFractionV, refValueV] = views(
++        domainVector.boundaryData().refGrad(),
++        domainVector.boundaryData().value(),
++        domainVector.boundaryData().valueFraction(),
++        domainVector.boundaryData().refValue()
++    );
++
++    NeoN::parallelFor(
++        domainVector.exec(),
++        range,
++        NEON_LAMBDA(const localIdx i) {
++            const NeoN::scalar inflow =
++                boundaryFlux[i] < NeoN::scalar(0) ? NeoN::scalar(1) : NeoN::scalar(0);
++            const Vec3 u = boundaryVelocity[i];
++            const NeoN::scalar magSqrU = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
++
++            NeoN::scalar p;
++            if (gamma > NeoN::scalar(1))
++            {
++                const NeoN::scalar gM1ByG = (gamma - NeoN::scalar(1)) / gamma;
++                p = p0
++                  / Kokkos::pow(
++                        NeoN::scalar(1)
++                            + NeoN::scalar(0.5) * boundaryPsi[i] * gM1ByG * inflow * magSqrU,
++                        NeoN::scalar(1) / gM1ByG
++                  );
++            }
++            else
++            {
++                p = p0 / (NeoN::scalar(1) + NeoN::scalar(0.5) * boundaryPsi[i] * inflow * magSqrU);
++            }
++
++            valueFractionV[i] = NeoN::scalar(1);
++            refValueV[i] = p;
++            refGradV[i] = NeoN::scalar(0);
++            valueV[i] = p;
++        },
++        "setCompressibleTotalPressureValue"
++    );
++}
++
+ } // namespace detail
+ 
+ // totalPressure fixes the *total* pressure on a patch: the static pressure it imposes is the
+@@ -100,7 +157,12 @@ void setTotalPressureValue(
+ // solver that wants the dynamic head must call correctBoundaryConditions(ctx) with phi and U
+ // inserted.
+ //
+-// Not modelled: the compressible forms (psi/rho variants) and a time-varying p0.
++// Compressible form: with the dictionary entry psi (the name of the compressibility field,
++// default "none") and gamma (default 1), the BC uses OpenFOAM's psi variant (see
++// detail::setCompressibleTotalPressureValue); psi, phi and U must all be in the context,
++// otherwise it falls back to the incompressible form.
++//
++// Not modelled: the rho variant and a time-varying p0.
+ template<typename ValueType>
+ class TotalPressure :
+     public VolumeBoundaryFactory<ValueType>::template Register<TotalPressure<ValueType>>
+@@ -118,7 +180,9 @@ public:
+         : Base(mesh, dict, patchID, {.assignable = true, .fixesValue = true}), mesh_(mesh),
+           p0_(dict.get<ValueType>("p0")), // required: an omitted datum is a case-setup error
+           phiName_(dict.contains("phi") ? dict.get<std::string>("phi") : std::string("phi")),
+-          uName_(dict.contains("U") ? dict.get<std::string>("U") : std::string("U"))
++          uName_(dict.contains("U") ? dict.get<std::string>("U") : std::string("U")),
++          psiName_(dict.contains("psi") ? dict.get<std::string>("psi") : std::string("none")),
++          gamma_(dict.contains("gamma") ? dict.get<NeoN::scalar>("gamma") : NeoN::scalar(1))
+     {}
+ 
+     // No context => no flux or velocity: a plain fixedValue at p0.
+@@ -143,6 +207,23 @@ public:
+         const bool hasFlux = ctx.hasSurfaceScalar(phiName_);
+         const bool hasVelocity = ctx.hasVector(uName_);
+ 
++        if constexpr (std::is_same<ValueType, NeoN::scalar>::value)
++        {
++            if (psiName_ != "none" && hasFlux && hasVelocity && ctx.hasScalar(psiName_))
++            {
++                detail::setCompressibleTotalPressureValue(
++                    domainVector,
++                    this->range(),
++                    p0_,
++                    gamma_,
++                    ctx.surfaceScalarField(phiName_).boundaryData().value().view(),
++                    ctx.vectorFieldPtr(uName_).boundaryData().value().view(),
++                    ctx.scalarFieldPtr(psiName_).boundaryData().value().view()
++                );
++                return;
++            }
++        }
++
+         detail::setTotalPressureValue(
+             domainVector,
+             mesh_,
+@@ -182,6 +263,8 @@ private:
+     ValueType p0_;
+     std::string phiName_;
+     std::string uName_;
++    std::string psiName_;
++    NeoN::scalar gamma_;
+ };
+ 
+ } // namespace NeoN::finiteVolume::cellCentred::volumeBoundary
+diff --git a/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalTemperature.hpp b/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalTemperature.hpp
+new file mode 100644
+index 00000000..71642683
+--- /dev/null
++++ b/include/NeoN/finiteVolume/cellCentred/boundary/volume/totalTemperature.hpp
+@@ -0,0 +1,151 @@
++// SPDX-FileCopyrightText: 2026 NeoN authors
++//
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++#include <Kokkos_Core.hpp>
++
++#include "NeoN/fields/field.hpp"
++#include "NeoN/finiteVolume/cellCentred/boundary/volumeBoundaryFactory.hpp"
++#include "NeoN/finiteVolume/cellCentred/boundary/boundaryContext.hpp"
++#include "NeoN/finiteVolume/cellCentred/fields/surfaceField.hpp"
++#include "NeoN/finiteVolume/cellCentred/fields/volumeField.hpp"
++#include "NeoN/mesh/unstructured/unstructuredMesh.hpp"
++#include "NeoN/core/parallelAlgorithms.hpp"
++
++namespace NeoN::finiteVolume::cellCentred::volumeBoundary
++{
++
++namespace detail
++{
++
++// T = T0 / (1 + 0.5 psi gM1ByG (1 - pos0(phi)) magSqr(U)), gM1ByG = (gamma - 1)/gamma.
++// Without flux, velocity or psi (hasFields == false) every face gets T0.
++inline void setTotalTemperatureValue(
++    Field<NeoN::scalar>& domainVector,
++    std::pair<localIdx, localIdx> range,
++    NeoN::scalar T0,
++    NeoN::scalar gamma,
++    bool hasFields,
++    View<const NeoN::scalar> boundaryFlux,
++    View<const Vec3> boundaryVelocity,
++    View<const NeoN::scalar> boundaryPsi
++)
++{
++    auto [refGradV, valueV, valueFractionV, refValueV] = views(
++        domainVector.boundaryData().refGrad(),
++        domainVector.boundaryData().value(),
++        domainVector.boundaryData().valueFraction(),
++        domainVector.boundaryData().refValue()
++    );
++    const NeoN::scalar gM1ByG = (gamma - NeoN::scalar(1)) / gamma;
++
++    NeoN::parallelFor(
++        domainVector.exec(),
++        range,
++        NEON_LAMBDA(const localIdx i) {
++            [[maybe_unused]] const View<const NeoN::scalar> flux = boundaryFlux;
++            [[maybe_unused]] const View<const Vec3> velocity = boundaryVelocity;
++            [[maybe_unused]] const View<const NeoN::scalar> psi = boundaryPsi;
++
++            NeoN::scalar T = T0;
++            if (hasFields && flux[i] < NeoN::scalar(0))
++            {
++                const Vec3 u = velocity[i];
++                const NeoN::scalar magSqrU = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
++                T = T0 / (NeoN::scalar(1) + NeoN::scalar(0.5) * psi[i] * gM1ByG * magSqrU);
++            }
++
++            valueFractionV[i] = NeoN::scalar(1);
++            refValueV[i] = T;
++            refGradV[i] = NeoN::scalar(0);
++            valueV[i] = T;
++        },
++        "setTotalTemperatureValue"
++    );
++}
++
++} // namespace detail
++
++// totalTemperature fixes the total temperature T0 of a stream entering the domain: the static
++// temperature is T0 on outflow and T0/(1 + 0.5 psi (gamma - 1)/gamma magSqr(U)) on inflow, as
++// OpenFOAM's totalTemperature. phi, U and psi are looked up by name in the BoundaryContext
++// (dictionary keys phi, U, psi; defaults "phi", "U", "psi"); gamma is required. Without them the
++// patch is a fixedValue at T0. Not modelled: a non-uniform T0.
++template<typename ValueType>
++class TotalTemperature :
++    public VolumeBoundaryFactory<ValueType>::template Register<TotalTemperature<ValueType>>
++{
++    using Base =
++        VolumeBoundaryFactory<ValueType>::template Register<TotalTemperature<ValueType>>;
++
++public:
++
++    using Base::correctBoundaryCondition;
++
++    TotalTemperature(const UnstructuredMesh& mesh, const Dictionary& dict, localIdx patchID)
++        : Base(mesh, dict, patchID, {.assignable = true, .fixesValue = true}),
++          T0_(dict.get<NeoN::scalar>("T0")), gamma_(dict.get<NeoN::scalar>("gamma")),
++          phiName_(dict.contains("phi") ? dict.get<std::string>("phi") : std::string("phi")),
++          uName_(dict.contains("U") ? dict.get<std::string>("U") : std::string("U")),
++          psiName_(dict.contains("psi") ? dict.get<std::string>("psi") : std::string("psi"))
++    {
++        NF_ASSERT(gamma_ > NeoN::scalar(0), "totalTemperature: gamma must be positive");
++    }
++
++    virtual void correctBoundaryCondition(Field<ValueType>& domainVector) final
++    {
++        detail::setTotalTemperatureValue(
++            domainVector, this->range(), T0_, gamma_, false, {}, {}, {}
++        );
++    }
++
++    virtual void
++    correctBoundaryCondition(Field<ValueType>& domainVector, const BoundaryContext& ctx) final
++    {
++        if (!(ctx.hasSurfaceScalar(phiName_) && ctx.hasVector(uName_) && ctx.hasScalar(psiName_)))
++        {
++            correctBoundaryCondition(domainVector);
++            return;
++        }
++        detail::setTotalTemperatureValue(
++            domainVector,
++            this->range(),
++            T0_,
++            gamma_,
++            true,
++            ctx.surfaceScalarField(phiName_).boundaryData().value().view(),
++            ctx.vectorFieldPtr(uName_).boundaryData().value().view(),
++            ctx.scalarFieldPtr(psiName_).boundaryData().value().view()
++        );
++    }
++
++    static std::string name() { return "totalTemperature"; }
++
++    std::string getName() const override { return name(); }
++
++    static std::string doc()
++    {
++        return "Total-temperature patch: T0 on outflow, T0/(1 + 0.5 psi (gamma-1)/gamma |U|^2) "
++               "on inflow. Needs phi, U and psi in the BoundaryContext; without them it is a "
++               "fixedValue at T0.";
++    }
++
++    static std::string schema() { return "none"; }
++
++    std::unique_ptr<VolumeBoundaryFactory<ValueType>> clone() const final
++    {
++        return std::make_unique<TotalTemperature>(*this);
++    }
++
++private:
++
++    NeoN::scalar T0_;
++    NeoN::scalar gamma_;
++    std::string phiName_;
++    std::string uName_;
++    std::string psiName_;
++};
++
++} // namespace NeoN::finiteVolume::cellCentred::volumeBoundary
+diff --git a/test/finiteVolume/cellCentred/boundary/volume/CMakeLists.txt b/test/finiteVolume/cellCentred/boundary/volume/CMakeLists.txt
+index cc91fa1e..8dfed2c0 100644
+--- a/test/finiteVolume/cellCentred/boundary/volume/CMakeLists.txt
++++ b/test/finiteVolume/cellCentred/boundary/volume/CMakeLists.txt
+@@ -8,3 +8,4 @@ neon_unit_test(volSymmetry)
+ neon_unit_test(volInletOutlet)
+ neon_unit_test(volTotalPressure)
+ neon_unit_test(volFixedFluxPressure)
++neon_unit_test(volCompressibleTotal)
+diff --git a/test/finiteVolume/cellCentred/boundary/volume/volCompressibleTotal.cpp b/test/finiteVolume/cellCentred/boundary/volume/volCompressibleTotal.cpp
+new file mode 100644
+index 00000000..267ca6da
+--- /dev/null
++++ b/test/finiteVolume/cellCentred/boundary/volume/volCompressibleTotal.cpp
+@@ -0,0 +1,172 @@
++// SPDX-FileCopyrightText: 2026 NeoN authors
++//
++// SPDX-License-Identifier: MIT
++
++#define CATCH_CONFIG_RUNNER
++#include "catch2_common.hpp"
++
++#include "NeoN/NeoN.hpp"
++
++#include <cmath>
++
++namespace fvcc = NeoN::finiteVolume::cellCentred;
++using NeoN::scalar;
++
++namespace
++{
++
++template<typename T>
++auto makeVol(const NeoN::Executor& exec, const NeoN::UnstructuredMesh& mesh, const std::string& name, T v)
++{
++    fvcc::VolumeField<T> f(
++        exec, name, mesh, fvcc::createCalculatedBCs<fvcc::VolumeBoundary<T>>(mesh)
++    );
++    NeoN::fill(f.internalVector(), v);
++    NeoN::fill(f.boundaryData().value(), v);
++    return f;
++}
++
++auto makeFlux(const NeoN::Executor& exec, const NeoN::UnstructuredMesh& mesh, scalar v)
++{
++    fvcc::SurfaceField<scalar> f(
++        exec, "phi", mesh, fvcc::createCalculatedBCs<fvcc::SurfaceBoundary<scalar>>(mesh)
++    );
++    NeoN::fill(f.internalVector(), v);
++    NeoN::fill(f.boundaryData().value(), v);
++    return f;
++}
++
++struct Result
++{
++    std::vector<scalar> value;
++    std::vector<scalar> valueFraction;
++};
++
++Result evaluate(
++    const NeoN::Executor& exec,
++    const NeoN::UnstructuredMesh& mesh,
++    const NeoN::Dictionary& dict,
++    const fvcc::BoundaryContext* ctx,
++    scalar internal
++)
++{
++    auto boundary = fvcc::VolumeBoundaryFactory<scalar>::create(
++        dict.get<std::string>("type"), mesh, dict, 0
++    );
++    auto field = NeoN::Field<scalar>(exec, mesh.nCells(), mesh.boundaryMesh().offset());
++    NeoN::fill(field.internalVector(), internal);
++    if (ctx)
++        boundary->correctBoundaryCondition(field, *ctx);
++    else
++        boundary->correctBoundaryCondition(field);
++    auto [vH, fH] = NeoN::copyToHosts(field.boundaryData().value(), field.boundaryData().valueFraction());
++    Result r;
++    for (auto v : vH.view(boundary->range())) r.value.push_back(v);
++    for (auto v : fH.view(boundary->range())) r.valueFraction.push_back(v);
++    return r;
++}
++
++} // namespace
++
++TEST_CASE("compressible total pressure, total temperature, subsonicSupersonicPressureOutlet")
++{
++    auto [execName, exec] = GENERATE(allAvailableExecutor());
++    auto mesh = NeoN::createSingleCellMesh(exec);
++
++    const scalar gamma = 1.4;
++    const scalar psi = 1.2; // 1/(R T)
++    const NeoN::Vec3 u {3.0, 4.0, 0.0}; // |U|^2 = 25
++    const scalar gM1ByG = (gamma - 1) / gamma;
++
++    auto U = makeVol<NeoN::Vec3>(exec, mesh, "U", u);
++    auto psiField = makeVol<scalar>(exec, mesh, "thermo:psi", psi);
++    auto gammaField = makeVol<scalar>(exec, mesh, "gamma", gamma);
++    auto inflow = makeFlux(exec, mesh, -1.0);
++    auto outflow = makeFlux(exec, mesh, 1.0);
++
++    auto context = [&](const fvcc::SurfaceField<scalar>& phi)
++    {
++        fvcc::BoundaryContext ctx;
++        ctx.insert("phi", phi);
++        ctx.insert("U", U);
++        ctx.insert("thermo:psi", psiField);
++        ctx.insert("gamma", gammaField);
++        return ctx;
++    };
++
++    SECTION("totalPressure with psi and gamma " + execName)
++    {
++        NeoN::Dictionary dict;
++        dict.insert("type", std::string("totalPressure"));
++        dict.insert("p0", scalar(1e5));
++        dict.insert("psi", std::string("thermo:psi"));
++        dict.insert("gamma", gamma);
++
++        const auto ctxIn = context(inflow);
++        const scalar expected = 1e5 / std::pow(1 + 0.5 * psi * gM1ByG * 25.0, 1 / gM1ByG);
++        for (auto v : evaluate(exec, mesh, dict, &ctxIn, 0).value)
++            REQUIRE(v == Catch::Approx(expected));
++
++        const auto ctxOut = context(outflow);
++        for (auto v : evaluate(exec, mesh, dict, &ctxOut, 0).value)
++            REQUIRE(v == Catch::Approx(1e5));
++    }
++
++    SECTION("totalTemperature " + execName)
++    {
++        NeoN::Dictionary dict;
++        dict.insert("type", std::string("totalTemperature"));
++        dict.insert("T0", scalar(300));
++        dict.insert("psi", std::string("thermo:psi"));
++        dict.insert("gamma", gamma);
++
++        const auto ctxIn = context(inflow);
++        for (auto v : evaluate(exec, mesh, dict, &ctxIn, 0).value)
++            REQUIRE(v == Catch::Approx(300 / (1 + 0.5 * psi * gM1ByG * 25.0)));
++
++        const auto ctxOut = context(outflow);
++        for (auto v : evaluate(exec, mesh, dict, &ctxOut, 0).value)
++            REQUIRE(v == Catch::Approx(300));
++
++        for (auto v : evaluate(exec, mesh, dict, nullptr, 0).value)
++            REQUIRE(v == Catch::Approx(300));
++    }
++
++    SECTION("subsonicSupersonicPressureOutlet " + execName)
++    {
++        NeoN::Dictionary dict;
++        dict.insert("type", std::string("subsonicSupersonicPressureOutlet"));
++        dict.insert("p0", scalar(2.0));
++        dict.insert("psi", std::string("thermo:psi"));
++
++        // c = sqrt(gamma/psi) = 1.08 < |U| = 5: supersonic, zero gradient.
++        {
++            const auto ctxIn = context(inflow);
++            const auto r = evaluate(exec, mesh, dict, &ctxIn, 7.0);
++            for (auto v : r.value) REQUIRE(v == Catch::Approx(7.0));
++            for (auto f : r.valueFraction) REQUIRE(f == Catch::Approx(0.0));
++        }
++
++        // Subsonic: a small velocity.
++        auto Uslow = makeVol<NeoN::Vec3>(exec, mesh, "U", NeoN::Vec3 {0.3, 0.4, 0.0});
++        fvcc::BoundaryContext ctx;
++        ctx.insert("phi", inflow);
++        ctx.insert("U", Uslow);
++        ctx.insert("thermo:psi", psiField);
++        ctx.insert("gamma", gammaField);
++        {
++            const auto r = evaluate(exec, mesh, dict, &ctx, 7.0);
++            for (auto v : r.value) REQUIRE(v == Catch::Approx(2.0 / (1 + psi * 0.25 * 0.5)));
++            for (auto f : r.valueFraction) REQUIRE(f == Catch::Approx(1.0));
++        }
++        fvcc::BoundaryContext ctxOut;
++        ctxOut.insert("phi", outflow);
++        ctxOut.insert("U", Uslow);
++        ctxOut.insert("thermo:psi", psiField);
++        ctxOut.insert("gamma", gammaField);
++        {
++            const auto r = evaluate(exec, mesh, dict, &ctxOut, 7.0);
++            for (auto v : r.value) REQUIRE(v == Catch::Approx(2.0));
++        }
++    }
++}

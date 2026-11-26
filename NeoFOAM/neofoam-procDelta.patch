@@ -1,0 +1,26 @@
+diff --git a/src/datastructures/meshAdapter.cpp b/src/datastructures/meshAdapter.cpp
+index 547b8ff0..a5ace7d1 100644
+--- a/src/datastructures/meshAdapter.cpp
++++ b/src/datastructures/meshAdapter.cpp
+@@ -194,9 +194,20 @@ readOpenFOAMMesh(const NeoN::Executor exec, const Foam::fvMesh& mesh, bool fullM
+         mesh,
+         [](const Foam::fvPatch& patch) { return Foam::vectorField(patch.nf()); }
+     );
++    // NeoN's BoundaryMesh::delta() is Cf - C_local on every boundary face, processor faces
++    // included (NeoN rebuilds C_nei - C_own by exchanging the halves, e.g. limitedLinear's
++    // procFaceDelta). OpenFOAM's fvPatch::delta() is the full C_nei - C_own on processor patches,
++    // so pass Cf - Cn there; the other patches keep fvPatch::delta().
+     Foam::vectorField delta = flatBCField<Foam::vectorField>(
+         mesh,
+-        [](const Foam::fvPatch& patch) { return Foam::vectorField(patch.delta()); }
++        [](const Foam::fvPatch& patch)
++        {
++            if (Foam::isA<Foam::processorFvPatch>(patch))
++            {
++                return Foam::vectorField(patch.Cf() - patch.Cn());
++            }
++            return Foam::vectorField(patch.delta());
++        }
+     );
+     Foam::scalarField weights = flatBCField<Foam::scalarField>(
+         mesh,

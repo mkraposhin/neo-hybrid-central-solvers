@@ -1,0 +1,430 @@
+diff --git a/include/NeoN/finiteVolume/cellCentred/interpolation/limitedLinear.hpp b/include/NeoN/finiteVolume/cellCentred/interpolation/limitedLinear.hpp
+index 68a05f11..c8736f42 100644
+--- a/include/NeoN/finiteVolume/cellCentred/interpolation/limitedLinear.hpp
++++ b/include/NeoN/finiteVolume/cellCentred/interpolation/limitedLinear.hpp
+@@ -34,6 +34,23 @@ void computeLimitedLinearWeights(
+     bool cellLimitedGradient = false
+ );
+ 
++/* @brief blended central/upwind weights of the limitedLinearV scheme (vector fields).
++ *
++ * Same blend as computeLimitedLinearWeights, but the TVD ratio is formed along the direction of
++ * the face difference dU = U_nei - U_own (OpenFOAM's NVDVTVDV): gradf = dU & dU and
++ * gradcf = dU & (gradU_upwind . d), where d = C_nei - C_own. One limiter is applied to all
++ * components, so the interpolated vector keeps the direction of the central/upwind blend.
++ */
++void computeLimitedLinearVWeights(
++    const VolumeField<Vec3>& src,
++    const SurfaceField<scalar>& flux,
++    const SurfaceField<scalar>& cdWeights,
++    const SurfaceField<Vec3>& faceDeltaOwner,
++    const SurfaceField<Vec3>& faceDeltaNeighbour,
++    scalar twoByk,
++    SurfaceField<scalar>& weights
++);
++
+ /* @brief limitedLinear surface interpolation.
+  *
+  * Registered for scalar fields only. Limiting a vector field is conventionally done on
+@@ -199,6 +216,133 @@ private:
+     bool cellLimitedGradient_;
+ };
+ 
++/* @brief limitedLinearV surface interpolation (Vec3 fields only).
++ *
++ * Spec: "limitedLinearV <k>", k in [0, 1]. The TVD ratio uses the unlimited Gauss-Green tensor
++ * gradient of the interpolated field.
++ */
++template<typename ValueType>
++class LimitedLinearV :
++    public SurfaceInterpolationFactory<ValueType>::template Register<LimitedLinearV<ValueType>>
++{
++    using Base =
++        SurfaceInterpolationFactory<ValueType>::template Register<LimitedLinearV<ValueType>>;
++
++public:
++
++    LimitedLinearV(const Executor& exec, const UnstructuredMesh& mesh, Input input)
++        : Base(exec, mesh), geometryScheme_(GeometryScheme::readOrCreate(mesh)),
++          twoByk_(readTwoByk(input))
++    {
++        geometryScheme_->ensureFaceDeltas();
++    };
++
++    static std::string name() { return "limitedLinearV"; }
++
++    static std::string doc() { return "limitedLinearV interpolation (TVD limited blend, vector)"; }
++
++    static std::string schema() { return "none"; }
++
++    void interpolate(const VolumeField<ValueType>&, SurfaceField<ValueType>&) const override
++    {
++        NF_ERROR_EXIT("limitedLinearV interpolation scheme requires a faceFlux");
++    }
++
++    void interpolate(
++        const SurfaceField<scalar>& flux,
++        const VolumeField<ValueType>& src,
++        SurfaceField<ValueType>& dst
++    ) const override
++    {
++        SurfaceField<scalar> blended(
++            src.exec(),
++            "limitedLinearVWeights",
++            src.mesh(),
++            createCalculatedBCs<SurfaceBoundary<scalar>>(src.mesh())
++        );
++        weight(flux, src, blended);
++        computeLinearInterpolation(src, blended, dst);
++    }
++
++    void weight(const VolumeField<ValueType>&, SurfaceField<scalar>&) const override
++    {
++        NF_ERROR_EXIT("limitedLinearV interpolation scheme requires a faceFlux");
++    }
++
++    void weight(
++        const SurfaceField<scalar>& flux,
++        const VolumeField<ValueType>& src,
++        SurfaceField<scalar>& weights
++    ) const override
++    {
++        computeLimitedLinearVWeights(
++            src,
++            flux,
++            geometryScheme_->weights(),
++            geometryScheme_->faceDeltaOwner(),
++            geometryScheme_->faceDeltaNeighbour(),
++            twoByk_,
++            weights
++        );
++    }
++
++    std::unique_ptr<SurfaceInterpolationFactory<ValueType>> clone() const override
++    {
++        return std::make_unique<LimitedLinearV>(*this);
++    }
++
++private:
++
++    static scalar readTwoByk(Input& input)
++    {
++        scalar k = 0;
++        if (std::holds_alternative<NeoN::TokenList>(input))
++        {
++            auto& tokens = std::get<NeoN::TokenList>(input);
++            if (tokens.peekIs<scalar>())
++            {
++                k = tokens.next<scalar>();
++            }
++            else if (tokens.peekIs<label>())
++            {
++                k = static_cast<scalar>(tokens.next<label>());
++            }
++            else
++            {
++                NF_THROW("limitedLinearV requires a numeric coefficient: 'limitedLinearV <k>'");
++            }
++            if (tokens.peekIs<std::string>())
++            {
++                NF_THROW(
++                    std::string("limitedLinearV accepts no option after its coefficient, got ")
++                    + tokens.next<std::string>()
++                );
++            }
++        }
++        else
++        {
++            const auto& dict = std::get<NeoN::Dictionary>(input);
++            if (!dict.contains("limitedLinearCoeff"))
++            {
++                NF_THROW("limitedLinearV requires the dictionary entry 'limitedLinearCoeff'");
++            }
++            k = dict.get<scalar>("limitedLinearCoeff");
++        }
++
++        if (!(k >= scalar(0) && k <= scalar(1)))
++        {
++            NF_THROW(
++                std::string("limitedLinearV coefficient must be in [0, 1], got ")
++                + std::to_string(k)
++            );
++        }
++        return scalar(2) / Kokkos::max(k, ROOTVSMALL);
++    }
++
++    const std::shared_ptr<GeometryScheme> geometryScheme_;
++    scalar twoByk_;
++};
++
+ } // namespace NeoN::finiteVolume::cellCentred
+ 
+ namespace NeoN
+@@ -207,5 +351,6 @@ namespace NeoN
+ namespace fvcc = finiteVolume::cellCentred;
+ 
+ template class fvcc::LimitedLinear<scalar>;
++template class fvcc::LimitedLinearV<Vec3>;
+ 
+ }
+diff --git a/src/finiteVolume/cellCentred/interpolation/limitedLinear.cpp b/src/finiteVolume/cellCentred/interpolation/limitedLinear.cpp
+index 670b0b8d..cd39e2a4 100644
+--- a/src/finiteVolume/cellCentred/interpolation/limitedLinear.cpp
++++ b/src/finiteVolume/cellCentred/interpolation/limitedLinear.cpp
+@@ -8,6 +8,7 @@
+ #include "NeoN/finiteVolume/cellCentred/operators/gaussGreenGrad.hpp"
+ #include "NeoN/core/containerFreeFunctions.hpp"
+ #include "NeoN/core/parallelAlgorithms.hpp"
++#include "NeoN/core/primitives/tensor.hpp"
+ 
+ namespace NeoN::finiteVolume::cellCentred
+ {
+@@ -256,4 +257,101 @@ void computeLimitedLinearWeights(
+     }
+ }
+ 
++void computeLimitedLinearVWeights(
++    const VolumeField<Vec3>& src,
++    const SurfaceField<scalar>& flux,
++    const SurfaceField<scalar>& cdWeights,
++    const SurfaceField<Vec3>& faceDeltaOwner,
++    const SurfaceField<Vec3>& faceDeltaNeighbour,
++    const scalar twoByk,
++    SurfaceField<scalar>& weights
++)
++{
++    const auto exec = weights.exec();
++    const auto& mesh = weights.mesh();
++
++    // gradU(i,j) = dU_i/dx_j, so (gradU & d) is the change of U along d (OpenFOAM's d & gradU).
++    VolumeField<Tensor> gradPhi(
++        exec, "limitedLinearVGrad", mesh, createCalculatedProcBCs<VolumeBoundary<Tensor>>(mesh)
++    );
++    fill(gradPhi.internalVector(), zero<Tensor>());
++    fill(gradPhi.boundaryData().value(), zero<Tensor>());
++    GaussGreenGrad(exec, mesh).gradTensor(src, gradPhi);
++    gradPhi.correctBoundaryConditions();
++
++    auto wS = weights.internalVector().view();
++    auto wB = weights.boundaryData().value().view();
++    const auto [srcS, gradS, cdS, dOwnS, dNeiS, fluxS, ownerS, neighS] = views(
++        src.internalVector(),
++        gradPhi.internalVector(),
++        cdWeights.internalVector(),
++        faceDeltaOwner.internalVector(),
++        faceDeltaNeighbour.internalVector(),
++        flux.internalVector(),
++        mesh.faceOwners(),
++        mesh.faceNeighbors()
++    );
++
++    const auto nBoundaryFaces = mesh.nBoundaryFaces();
++
++    parallelFor(
++        exec,
++        {0, mesh.nInternalFaces()},
++        NEON_LAMBDA(const localIdx facei) {
++            const auto own = ownerS[facei];
++            const auto nei = neighS[facei];
++            const Vec3 d = dOwnS[facei] - dNeiS[facei];
++            const Vec3 gradfV = srcS[nei] - srcS[own];
++            const scalar gradf = gradfV & gradfV;
++            const scalar gradcf =
++                gradfV & ((fluxS[facei] > scalar(0) ? gradS[own] : gradS[nei]) & d);
++            const scalar limiter = limitedLinearLimiter(twoByk, gradf, gradcf);
++            const scalar upwindW = fluxS[facei] >= scalar(0) ? scalar(1) : scalar(0);
++            wS[facei] = limiter * cdS[facei] + (scalar(1) - limiter) * upwindW;
++        },
++        "computeLimitedLinearVWeightsInternal"
++    );
++
++    parallelFor(
++        exec,
++        {0, nBoundaryFaces},
++        NEON_LAMBDA(const localIdx bfi) { wB[bfi] = scalar(1); },
++        "computeLimitedLinearVWeightsBoundary"
++    );
++
++    const auto nProcBoundaryFaces = mesh.nProcBoundaryFaces();
++    if (nProcBoundaryFaces > 0)
++    {
++        const auto& bMesh = mesh.boundaryMesh();
++        const auto bOwners = bMesh.faceOwners().view();
++        const auto bNormalSignV = bMesh.weights().view();
++        const auto bSrcV = src.boundaryData().value().view();
++        const auto bGradV = gradPhi.boundaryData().value().view();
++        const auto bFluxV = flux.boundaryData().value().view();
++        const auto bCdV = cdWeights.boundaryData().value().view();
++        const auto procDelta = procFaceDelta(exec, mesh);
++        const auto dProcV = procDelta->view();
++
++        parallelFor(
++            exec,
++            {0, nProcBoundaryFaces},
++            NEON_LAMBDA(const localIdx procFacei) {
++                const auto bcfacei = nBoundaryFaces + procFacei;
++                const auto own = bOwners[bcfacei];
++                const scalar outwardFlux = bNormalSignV[bcfacei] * bFluxV[bcfacei];
++                const Vec3 gradfV = bSrcV[bcfacei] - srcS[own];
++                const scalar gradf = gradfV & gradfV;
++                const scalar gradcf =
++                    gradfV
++                    & ((outwardFlux > scalar(0) ? gradS[own] : bGradV[bcfacei]) & dProcV[procFacei]
++                    );
++                const scalar limiter = limitedLinearLimiter(twoByk, gradf, gradcf);
++                const scalar upwindW = outwardFlux >= scalar(0) ? scalar(1) : scalar(0);
++                wB[bcfacei] = limiter * bCdV[bcfacei] + (scalar(1) - limiter) * upwindW;
++            },
++            "computeLimitedLinearVWeightsProcBoundary"
++        );
++    }
++}
++
+ } // namespace NeoN::finiteVolume::cellCentred
+diff --git a/test/finiteVolume/cellCentred/interpolation/CMakeLists.txt b/test/finiteVolume/cellCentred/interpolation/CMakeLists.txt
+index 78ee4448..041e478e 100644
+--- a/test/finiteVolume/cellCentred/interpolation/CMakeLists.txt
++++ b/test/finiteVolume/cellCentred/interpolation/CMakeLists.txt
+@@ -8,3 +8,4 @@ neon_unit_test(linearUpwind)
+ neon_unit_test(surfaceInterpolation)
+ neon_unit_test(linearUpwindV)
+ neon_unit_test(limitedLinear)
++neon_unit_test(limitedLinearV)
+diff --git a/test/finiteVolume/cellCentred/interpolation/limitedLinearV.cpp b/test/finiteVolume/cellCentred/interpolation/limitedLinearV.cpp
+new file mode 100644
+index 00000000..57537c36
+--- /dev/null
++++ b/test/finiteVolume/cellCentred/interpolation/limitedLinearV.cpp
+@@ -0,0 +1,132 @@
++// SPDX-FileCopyrightText: 2026 NeoN authors
++//
++// SPDX-License-Identifier: MIT
++
++#define CATCH_CONFIG_RUNNER // Define this before including catch.hpp to create
++                            // a custom main
++#include "catch2_common.hpp"
++
++#include "NeoN/NeoN.hpp"
++
++#include <algorithm>
++
++using NeoN::toLocalIdx;
++using NeoN::finiteVolume::cellCentred::SurfaceField;
++using NeoN::finiteVolume::cellCentred::SurfaceInterpolation;
++using NeoN::finiteVolume::cellCentred::VolumeField;
++
++namespace NeoN
++{
++
++template<typename T>
++using I = std::initializer_list<T>;
++
++namespace
++{
++
++// Face values of limitedLinear (scalar) or limitedLinearV (Vec3) on a 1D uniform mesh with a
++// uniform flux of the given sign and fixed boundary values.
++template<typename ValueType>
++std::vector<ValueType> interpolate1D(
++    const Executor& exec,
++    const std::vector<ValueType>& cellValues,
++    const ValueType boundaryValue,
++    const scalar k,
++    const scalar fluxSign
++)
++{
++    auto mesh = create1DUniformMesh(exec, static_cast<localIdx>(cellValues.size()));
++    const std::string name =
++        std::is_same_v<ValueType, scalar> ? std::string("limitedLinear") : "limitedLinearV";
++    auto scheme = SurfaceInterpolation<ValueType>(exec, mesh, TokenList({name, k}));
++
++    std::vector<fvcc::VolumeBoundary<ValueType>> vbcs {};
++    std::vector<fvcc::SurfaceBoundary<ValueType>> sbcs {};
++    for (auto patchi : I<localIdx> {0, 1})
++    {
++        Dictionary dict;
++        dict.insert("type", std::string("fixedValue"));
++        dict.insert("fixedValue", boundaryValue);
++        vbcs.push_back(fvcc::VolumeBoundary<ValueType>(mesh, dict, patchi));
++        sbcs.push_back(fvcc::SurfaceBoundary<ValueType>(mesh, dict, patchi));
++    }
++
++    auto in = VolumeField<ValueType>(exec, "in", mesh, vbcs);
++    auto flux = SurfaceField<scalar>(exec, "flux", mesh, {});
++    auto out = SurfaceField<ValueType>(exec, "out", mesh, sbcs);
++
++    in.internalVector() = Vector<ValueType>(exec, cellValues);
++    in.correctBoundaryConditions();
++    fill(flux.internalVector(), fluxSign);
++
++    scheme.interpolate(flux, in, out);
++    auto host = out.internalVector().copyToHost();
++    return std::vector<ValueType>(host.view().begin(), host.view().end());
++}
++
++} // namespace
++
++TEST_CASE("limitedLinearV is registered for vector fields only")
++{
++    const auto vectorEntries = fvcc::SurfaceInterpolationFactory<Vec3>::entries();
++    const auto scalarEntries = fvcc::SurfaceInterpolationFactory<scalar>::entries();
++
++    auto has = [](const auto& entries, const std::string& key)
++    { return std::find(entries.begin(), entries.end(), key) != entries.end(); };
++
++    REQUIRE(has(vectorEntries, "limitedLinearV"));
++    REQUIRE_FALSE(has(scalarEntries, "limitedLinearV"));
++}
++
++// For U = phi * e the direction of the face difference is e everywhere, so the TVD ratio of
++// limitedLinearV equals the scalar ratio of phi: each component must equal limitedLinear(phi)*e.
++TEST_CASE("limitedLinearV reduces to limitedLinear for a field of fixed direction")
++{
++    auto [execName, exec] = GENERATE(allAvailableExecutor());
++    INFO("executor: " << execName);
++
++    const scalar k = GENERATE(1.0, 0.5);
++    const scalar fluxSign = GENERATE(1.0, -1.0);
++    INFO("k = " << k << ", flux sign = " << fluxSign);
++
++    // A step with an overshoot and a smooth part: the limiter takes all values in [0, 1].
++    const std::vector<scalar> phi {1.0, 1.0, 1.0, 0.9, 0.3, 0.1, 0.12, 0.2, 0.25, 0.27};
++    const Vec3 e(1.0, -2.0, 0.5);
++
++    std::vector<Vec3> U(phi.size());
++    std::transform(phi.begin(), phi.end(), U.begin(), [&](scalar v) { return v * e; });
++
++    const auto phiF = interpolate1D<scalar>(exec, phi, 0.5, k, fluxSign);
++    const auto UF = interpolate1D<Vec3>(exec, U, 0.5 * e, k, fluxSign);
++
++    REQUIRE(phiF.size() == UF.size());
++    for (localIdx i = 0; i < toLocalIdx(phiF.size()); ++i)
++    {
++        INFO("face " << i);
++        for (std::size_t c = 0; c < 3; ++c)
++        {
++            REQUIRE(UF[i][c] == Catch::Approx(phiF[i] * e[c]).margin(1e-12));
++        }
++    }
++}
++
++// A constant field is reproduced exactly.
++TEST_CASE("limitedLinearV preserves a constant vector field")
++{
++    auto [execName, exec] = GENERATE(allAvailableExecutor());
++    INFO("executor: " << execName);
++
++    const Vec3 u(2.0, -1.0, 3.0);
++    const std::vector<Vec3> U(8, u);
++    const auto UF = interpolate1D<Vec3>(exec, U, u, 1.0, 1.0);
++
++    for (const auto& f : UF)
++    {
++        for (std::size_t c = 0; c < 3; ++c)
++        {
++            REQUIRE(f[c] == Catch::Approx(u[c]).margin(1e-12));
++        }
++    }
++}
++
++} // namespace NeoN

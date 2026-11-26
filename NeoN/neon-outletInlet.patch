@@ -1,0 +1,333 @@
+--- a/include/NeoN/finiteVolume/cellCentred/boundary.hpp
++++ b/include/NeoN/finiteVolume/cellCentred/boundary.hpp
+@@ -19,6 +19,7 @@
+ #include "boundary/volume/symmetry.hpp"
+ #include "boundary/volume/slip.hpp"
+ #include "boundary/volume/inletOutlet.hpp"
++#include "boundary/volume/outletInlet.hpp"
+ #include "boundary/volume/totalPressure.hpp"
+ #include "boundary/volume/totalTemperature.hpp"
+ #include "boundary/volume/subsonicSupersonicPressureOutlet.hpp"
+@@ -141,6 +142,8 @@
+ 
+ template class fvcc::volumeBoundary::InletOutlet<scalar>;
+ template class fvcc::volumeBoundary::InletOutlet<Vec3>;
++template class fvcc::volumeBoundary::OutletInlet<scalar>;
++template class fvcc::volumeBoundary::OutletInlet<Vec3>;
+ template class fvcc::volumeBoundary::TotalPressure<scalar>;
+ template class fvcc::volumeBoundary::TotalTemperature<scalar>;
+ template class fvcc::volumeBoundary::SubsonicSupersonicPressureOutlet<scalar>;
+--- a/test/finiteVolume/cellCentred/boundary/volume/CMakeLists.txt
++++ b/test/finiteVolume/cellCentred/boundary/volume/CMakeLists.txt
+@@ -6,6 +6,7 @@
+ neon_unit_test(volFixedGradient)
+ neon_unit_test(volSymmetry)
+ neon_unit_test(volInletOutlet)
++neon_unit_test(volOutletInlet)
+ neon_unit_test(volTotalPressure)
+ neon_unit_test(volFixedFluxPressure)
+ neon_unit_test(volCompressibleTotal)
+--- a/include/NeoN/finiteVolume/cellCentred/boundary/volume/outletInlet.hpp
++++ b/include/NeoN/finiteVolume/cellCentred/boundary/volume/outletInlet.hpp
+@@ -0,0 +1,154 @@
++// SPDX-FileCopyrightText: 2026 NeoN authors
++//
++// SPDX-License-Identifier: MIT
++
++#pragma once
++
++#include <Kokkos_Core.hpp>
++
++#include "NeoN/fields/field.hpp"
++#include "NeoN/core/primitives/traits.hpp"
++#include "NeoN/finiteVolume/cellCentred/boundary/volumeBoundaryFactory.hpp"
++#include "NeoN/finiteVolume/cellCentred/boundary/boundaryContext.hpp"
++#include "NeoN/finiteVolume/cellCentred/fields/surfaceField.hpp"
++#include "NeoN/mesh/unstructured/unstructuredMesh.hpp"
++#include "NeoN/core/parallelAlgorithms.hpp"
++
++namespace NeoN::finiteVolume::cellCentred::volumeBoundary
++{
++
++namespace detail
++{
++// Kernel behind outletInlet, the mirror image of inletOutlet. Per boundary face it switches
++// between two mixed-BC states according to the sign of the face flux phi:
++//   outflow (phi >  0): Dirichlet    -> valueFraction = 1, refValue = outletValue, refGrad = 0
++//   inflow  (phi <= 0): zeroGradient -> valueFraction = 0, refGrad = 0
++// as OpenFOAM's outletInlet (a mixedFvPatchField with valueFraction = pos0(phi) evaluated on the
++// patch flux; OpenFOAM uses pos0, i.e. phi = 0 counts as outflow, which is reproduced here).
++// The explicit face value is
++//   value = valueFraction*outletValue + (1 - valueFraction)*phi_C.
++//
++// When no flux is available (hasFlux == false) every face is treated as inflow, degenerating to
++// a pure zeroGradient BC (the same fallback as inletOutlet).
++template<typename ValueType>
++void setOutletInletValue(
++    Field<ValueType>& domainVector,
++    const UnstructuredMesh& mesh,
++    std::pair<localIdx, localIdx> range,
++    ValueType outletValue,
++    View<const NeoN::scalar> boundaryFlux,
++    bool hasFlux
++)
++{
++    const auto internalV = domainVector.internalVector().view();
++
++    auto [refGradV, valueV, valueFractionV, refValueV, boundaryFaceOwnersV] = views(
++        domainVector.boundaryData().refGrad(),
++        domainVector.boundaryData().value(),
++        domainVector.boundaryData().valueFraction(),
++        domainVector.boundaryData().refValue(),
++        mesh.boundaryMesh().faceOwners()
++    );
++
++    NeoN::parallelFor(
++        domainVector.exec(),
++        range,
++        NEON_LAMBDA(const localIdx i) {
++            const localIdx owner = boundaryFaceOwnersV[i];
++            const auto internal = internalV[owner];
++
++            // Outflow where the face flux is non-negative; otherwise inflow (zero-gradient).
++            const NeoN::scalar valueFraction = (hasFlux && boundaryFlux[i] >= 0.0) ? 1.0 : 0.0;
++
++            valueFractionV[i] = valueFraction;
++            refValueV[i] = outletValue;
++            refGradV[i] = NeoN::zero<ValueType>();
++            valueV[i] = outletValue * valueFraction + internal * (1.0 - valueFraction);
++        },
++        "setOutletInletValue"
++    );
++}
++
++}
++
++// outletInlet fixes the value on outflow faces and extrapolates (zero gradient) on inflow faces,
++// decided per face by the sign of the face flux phi. It mirrors OpenFOAM's outletInlet
++// (mixedFvPatchField with valueFraction = pos0(phi), refValue = outletValue, refGrad = 0).
++//
++// The flux is looked up by name (key "phi", default "phi") from the BoundaryContext passed to the
++// context-aware correctBoundaryCondition overload. The plain overload has no flux and degenerates
++// to zeroGradient.
++template<typename ValueType>
++class OutletInlet :
++    public VolumeBoundaryFactory<ValueType>::template Register<OutletInlet<ValueType>>
++{
++    using Base =
++        typename VolumeBoundaryFactory<ValueType>::template Register<OutletInlet<ValueType>>;
++
++public:
++
++    using Base::correctBoundaryCondition;
++
++    // As inletOutlet: the boundary value is recomputed every correction (assignable), and the
++    // per-face refValue/valueFraction drive the operators (no global Dirichlet flag).
++    OutletInlet(const UnstructuredMesh& mesh, const Dictionary& dict, localIdx patchID)
++        : Base(mesh, dict, patchID, {.assignable = true, .fixesValue = false}), mesh_(mesh),
++          outletValue_(dict.get<ValueType>("outletValue")),
++          phiName_(dict.contains("phi") ? dict.get<std::string>("phi") : std::string("phi"))
++    {}
++
++    // No context => no flux available: behave as zero-gradient.
++    virtual void correctBoundaryCondition(Field<ValueType>& domainVector) final
++    {
++        detail::setOutletInletValue(
++            domainVector, mesh_, this->range(), outletValue_, View<const NeoN::scalar> {}, false
++        );
++    }
++
++    // Context-aware: read the face flux phi and switch outflow/inflow per face.
++    virtual void
++    correctBoundaryCondition(Field<ValueType>& domainVector, const BoundaryContext& ctx) final
++    {
++        if (ctx.hasSurfaceScalar(phiName_))
++        {
++            const auto& phi = ctx.surfaceScalarField(phiName_);
++            detail::setOutletInletValue(
++                domainVector,
++                mesh_,
++                this->range(),
++                outletValue_,
++                phi.boundaryData().value().view(),
++                true
++            );
++        }
++        else
++        {
++            correctBoundaryCondition(domainVector);
++        }
++    }
++
++    static std::string name() { return "outletInlet"; }
++
++    std::string getName() const override { return name(); }
++
++    static std::string doc()
++    {
++        return "Outlet/inlet: fixed outletValue on outflow faces, zero-gradient on inflow faces "
++               "(switched per face by the sign of the face flux phi).";
++    }
++
++    static std::string schema() { return "none"; }
++
++    virtual std::unique_ptr<VolumeBoundaryFactory<ValueType>> clone() const final
++    {
++        return std::make_unique<OutletInlet>(*this);
++    }
++
++private:
++
++    const UnstructuredMesh& mesh_;
++    ValueType outletValue_;
++    std::string phiName_;
++};
++
++} // namespace NeoN::finiteVolume::cellCentred::volumeBoundary
+--- a/test/finiteVolume/cellCentred/boundary/volume/volOutletInlet.cpp
++++ b/test/finiteVolume/cellCentred/boundary/volume/volOutletInlet.cpp
+@@ -0,0 +1,144 @@
++// SPDX-FileCopyrightText: 2026 NeoN authors
++//
++// SPDX-License-Identifier: MIT
++
++#define CATCH_CONFIG_RUNNER
++#include "catch2_common.hpp"
++
++#include "NeoN/NeoN.hpp"
++
++namespace fvcc = NeoN::finiteVolume::cellCentred;
++
++// Build a face-flux phi (surface scalar field) whose boundary faces all carry `flux`.
++fvcc::SurfaceField<NeoN::scalar>
++makeFlux(const NeoN::Executor& exec, const NeoN::UnstructuredMesh& mesh, NeoN::scalar flux)
++{
++    auto bcs = fvcc::createCalculatedBCs<fvcc::SurfaceBoundary<NeoN::scalar>>(mesh);
++    fvcc::SurfaceField<NeoN::scalar> phi(exec, "phi", mesh, bcs);
++    NeoN::fill(phi.internalVector(), flux);
++    NeoN::fill(phi.boundaryData().value(), flux);
++    return phi;
++}
++
++TEST_CASE("outletInlet_volume")
++{
++    auto [execName, exec] = GENERATE(allAvailableExecutor());
++
++    SECTION("scalar: outflow => fixedValue, inflow => zeroGradient " + execName)
++    {
++        auto mesh = NeoN::createSingleCellMesh(exec);
++
++        NeoN::Dictionary dict;
++        dict.insert("type", std::string("outletInlet"));
++        dict.insert("outletValue", NeoN::scalar(7.0));
++        auto boundary =
++            fvcc::VolumeBoundaryFactory<NeoN::scalar>::create("outletInlet", mesh, dict, 0);
++
++        REQUIRE(boundary->attributes().fixesValue == false);
++
++        // outflow (phi > 0) and phi = 0 (OpenFOAM's pos0): Dirichlet outletValue
++        for (const NeoN::scalar flux : {2.0, 0.0})
++        {
++            auto field =
++                NeoN::Field<NeoN::scalar>(exec, mesh.nCells(), mesh.boundaryMesh().offset());
++            NeoN::fill(field.internalVector(), 4.0);
++
++            auto phi = makeFlux(exec, mesh, flux);
++            fvcc::BoundaryContext ctx;
++            ctx.insert("phi", phi);
++
++            boundary->correctBoundaryCondition(field, ctx);
++
++            auto [valuesH, refValuesH, refGradH, valueFractionH] = copyToHosts(
++                field.boundaryData().value(),
++                field.boundaryData().refValue(),
++                field.boundaryData().refGrad(),
++                field.boundaryData().valueFraction()
++            );
++
++            for (auto& v : valuesH.view(boundary->range()))
++                REQUIRE(v == Catch::Approx(7.0));
++            for (auto& v : refValuesH.view(boundary->range()))
++                REQUIRE(v == Catch::Approx(7.0));
++            for (auto& f : valueFractionH.view(boundary->range()))
++                REQUIRE(f == Catch::Approx(1.0));
++            for (auto& g : refGradH.view(boundary->range()))
++                REQUIRE(g == Catch::Approx(0.0));
++        }
++
++        // inflow (phi < 0): zero-gradient (owner-cell value)
++        {
++            auto field =
++                NeoN::Field<NeoN::scalar>(exec, mesh.nCells(), mesh.boundaryMesh().offset());
++            NeoN::fill(field.internalVector(), 4.0);
++
++            auto phi = makeFlux(exec, mesh, -2.0);
++            fvcc::BoundaryContext ctx;
++            ctx.insert("phi", phi);
++
++            boundary->correctBoundaryCondition(field, ctx);
++
++            auto [valuesH, valueFractionH] =
++                copyToHosts(field.boundaryData().value(), field.boundaryData().valueFraction());
++
++            for (auto& v : valuesH.view(boundary->range()))
++                REQUIRE(v == Catch::Approx(4.0));
++            for (auto& f : valueFractionH.view(boundary->range()))
++                REQUIRE(f == Catch::Approx(0.0));
++        }
++
++        // no context => no flux => zero-gradient
++        {
++            auto field =
++                NeoN::Field<NeoN::scalar>(exec, mesh.nCells(), mesh.boundaryMesh().offset());
++            NeoN::fill(field.internalVector(), 4.0);
++
++            boundary->correctBoundaryCondition(field);
++
++            auto [valuesH, valueFractionH] =
++                copyToHosts(field.boundaryData().value(), field.boundaryData().valueFraction());
++
++            for (auto& v : valuesH.view(boundary->range()))
++                REQUIRE(v == Catch::Approx(4.0));
++            for (auto& f : valueFractionH.view(boundary->range()))
++                REQUIRE(f == Catch::Approx(0.0));
++        }
++    }
++
++    SECTION("vector: outflow => fixedValue, inflow => zeroGradient " + execName)
++    {
++        auto mesh = NeoN::createSingleCellMesh(exec);
++        const NeoN::Vec3 outletValue(1.0, 2.0, 3.0);
++        const NeoN::Vec3 internal(-1.0, -1.0, -1.0);
++
++        NeoN::Dictionary dict;
++        dict.insert("type", std::string("outletInlet"));
++        dict.insert("outletValue", outletValue);
++        auto boundary =
++            fvcc::VolumeBoundaryFactory<NeoN::Vec3>::create("outletInlet", mesh, dict, 0);
++
++        for (const NeoN::scalar flux : {2.0, -2.0})
++        {
++            auto field = NeoN::Field<NeoN::Vec3>(exec, mesh.nCells(), mesh.boundaryMesh().offset());
++            NeoN::fill(field.internalVector(), internal);
++
++            auto phi = makeFlux(exec, mesh, flux);
++            fvcc::BoundaryContext ctx;
++            ctx.insert("phi", phi);
++
++            boundary->correctBoundaryCondition(field, ctx);
++
++            auto [valuesH, valueFractionH] =
++                copyToHosts(field.boundaryData().value(), field.boundaryData().valueFraction());
++
++            const NeoN::Vec3 expected = flux > 0 ? outletValue : internal;
++            for (auto& v : valuesH.view(boundary->range()))
++            {
++                const auto i = static_cast<NeoN::localIdx>(&v - valuesH.data());
++                REQUIRE(valueFractionH.view()[i] == Catch::Approx(flux > 0 ? 1.0 : 0.0));
++                for (auto d = 0u; d < 3; ++d)
++                    REQUIRE(v[d] == Catch::Approx(expected[d]));
++            }
++        }
++    }
++}
